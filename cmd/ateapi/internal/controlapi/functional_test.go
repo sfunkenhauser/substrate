@@ -1825,6 +1825,122 @@ func TestResumeActor_ReleasesStaleWorkerWhenPoolBecomesIneligible(t *testing.T) 
 	}
 }
 
+// TestResumeActor_ReleasesDrainingWorkerFromPriorAttempt exercises the reuse-loop
+// change in AssignWorkerStep.Execute: a worker still assigned to the actor from a
+// previous (failed) attempt that has since entered DRAINING must not be reused —
+// it is released and the actor is rescheduled onto a fresh worker.
+func TestResumeActor_ReleasesDrainingWorkerFromPriorAttempt(t *testing.T) {
+	ns := namespaceForTest("ns-resume-release-draining")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	// createTemplate sets up pool1 (labeled pool=<ns>) + tmpl1 (selecting it) with
+	// a golden snapshot, so resume drives Restore. Two workers share the pool.
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-a", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-b", "node1", "pool1")
+
+	id := "id1"
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: testAtespace,
+				Name:     id,
+			},
+			ActorTemplateNamespace: ns,
+			ActorTemplateName:      "tmpl1",
+		},
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	// First resume fails after a worker is assigned, leaving the actor bound to
+	// that worker from a prior attempt.
+	tc.fakeAtelet.FailRestore = fmt.Errorf("mock atelet failure")
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: id}}); err == nil {
+		t.Fatalf("expected first ResumeActor to fail")
+	}
+	tc.fakeAtelet.FailRestore = nil
+
+	// Learn which worker got assigned (findFreeWorker shuffles), then mark it
+	// DRAINING as the syncer would when its pod enters Terminating.
+	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: id}})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	assignedPod := getResp.GetAteomPodName()
+	if assignedPod == "" {
+		t.Fatalf("expected actor to be bound to a worker after the failed attempt")
+	}
+	otherPod := "worker-a"
+	if assignedPod == "worker-a" {
+		otherPod = "worker-b"
+	}
+
+	assigned, err := tc.persistence.GetWorker(context.Background(), ns, "pool1", assignedPod)
+	if err != nil {
+		t.Fatalf("GetWorker(%s) failed: %v", assignedPod, err)
+	}
+	assigned.State = ateapipb.Worker_STATE_DRAINING
+	if err := tc.persistence.UpdateWorker(context.Background(), assigned, assigned.GetVersion()); err != nil {
+		t.Fatalf("marking worker %s draining failed: %v", assignedPod, err)
+	}
+
+	// Wait until the DRAINING state is observable, which also gives the store
+	// watch time to propagate it into the scheduler's worker cache.
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		resp, err := tc.client.ListWorkers(ctx, &ateapipb.ListWorkersRequest{})
+		if err != nil {
+			return false, nil
+		}
+		for _, w := range resp.GetWorkers() {
+			if w.GetWorkerNamespace() == ns && w.GetWorkerPod() == assignedPod {
+				return w.GetState() == ateapipb.Worker_STATE_DRAINING, nil
+			}
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("worker %s did not reach DRAINING: %v", assignedPod, err)
+	}
+
+	// Second resume must skip and release the draining worker, then land on the other.
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: id}}); err != nil {
+		t.Fatalf("second ResumeActor failed: %v", err)
+	}
+
+	getResp, err = tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: id}})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	if got := getResp.GetStatus(); got != ateapipb.Actor_STATUS_RUNNING {
+		t.Errorf("expected actor status RUNNING, got %v", got)
+	}
+	if got := getResp.GetAteomPodName(); got != otherPod {
+		t.Errorf("expected actor rescheduled onto %q, got %q", otherPod, got)
+	}
+
+	// The draining worker must have been released; the other must be claimed.
+	listResp, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{})
+	if err != nil {
+		t.Fatalf("ListWorkers failed: %v", err)
+	}
+	for _, w := range listResp.GetWorkers() {
+		if w.GetWorkerNamespace() != ns {
+			continue
+		}
+		switch w.GetWorkerPod() {
+		case assignedPod:
+			if w.GetAssignment() != nil {
+				t.Errorf("expected draining worker %q to be released, still assigned to %q", assignedPod, w.GetAssignment().GetActor().GetName())
+			}
+		case otherPod:
+			if got := w.GetAssignment().GetActor().GetName(); got != id {
+				t.Errorf("expected worker %q to be claimed by %q, got %q", otherPod, id, got)
+			}
+		}
+	}
+}
+
 // TestUpdateActor_ReassignsPoolAcrossSuspendResume verifies that updating an
 // actor's worker_selector moves it onto a different eligible pool not just
 // on the next fresh resume, but also across a full suspend/resume cycle of

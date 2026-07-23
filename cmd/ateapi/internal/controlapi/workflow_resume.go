@@ -182,7 +182,7 @@ func (s *AssignWorkerStep) Execute(ctx context.Context, input *ResumeInput, stat
 		if err != nil {
 			return fmt.Errorf("while checking worker eligibility: %w", err)
 		}
-		if eligible {
+		if eligible && worker.GetState() != ateapipb.Worker_STATE_DRAINING {
 			assignedWorker = worker
 			break
 		}
@@ -276,7 +276,7 @@ func (s *AssignWorkerStep) findFreeWorker(
 		if err != nil {
 			return nil, err
 		}
-		if !eligible {
+		if !eligible || worker.GetState() == ateapipb.Worker_STATE_DRAINING {
 			continue
 		}
 		if len(nodesRestrictions) == 0 || slices.Contains(nodesRestrictions, worker.GetNodeName()) {
