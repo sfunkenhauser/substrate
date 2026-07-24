@@ -29,8 +29,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
@@ -45,7 +47,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -139,12 +143,30 @@ func do(ctx context.Context) error {
 	// serialized through one SyncedWriter and never interleave-corrupt lines.
 	actorLogger := actorlog.NewActorLogger(logWriter, metadata.OnGCE())
 
+	ateomService := NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger)
+
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
 	)
-	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger))
+	ateompb.RegisterAteomServer(svr, ateomService)
 	reflection.Register(svr)
+
+	// Trap SIGTERM (sent by the kubelet at the start of the pod's termination grace
+	// period) and propagate it into the guest so the actor can save its state and
+	// exit cleanly before the grace period expires. We deliberately do not call
+	// svr.GracefulStop(): the server stays up so it can reject new workload RPCs
+	// with codes.Unavailable while draining (see rejectIfDraining).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.InfoContext(ctx, "Received signal; beginning graceful shutdown", slog.String("signal", sig.String()))
+		// Use a fresh context: the do() context is torn down on return, but the
+		// shutdown must outlive it until the guest has stopped and the VM is down.
+		ateomService.gracefulShutdown(context.Background())
+		os.Exit(0)
+	}()
 
 	slog.InfoContext(ctx, "ateom-microvm serving", slog.String("socket", sockPath))
 	if err := svr.Serve(lis); err != nil {
@@ -189,6 +211,11 @@ type AteomService struct {
 	// lifecycle is not safe to drive concurrently.
 	lock sync.Mutex
 
+	// shuttingDown is set once SIGTERM has been received. While true, new workload
+	// RPCs are rejected with codes.Unavailable so the control plane reschedules.
+	// Guarded by lock.
+	shuttingDown bool
+
 	podUID     string
 	chBinary   string
 	kataConfig string
@@ -222,4 +249,14 @@ func NewService(podUID, chBinary, kataConfig string, kataDebug bool, interiorNet
 		actorLogger:   actorLogger,
 		running:       map[string]*runningActor{},
 	}
+}
+
+// rejectIfDraining returns a codes.Unavailable error if ateom has begun graceful
+// shutdown, so the control plane reschedules the actor onto a live worker. Must
+// be called with s.lock held.
+func (s *AteomService) rejectIfDraining() error {
+	if s.shuttingDown {
+		return status.Error(codes.Unavailable, "worker draining: not accepting new workloads")
+	}
+	return nil
 }

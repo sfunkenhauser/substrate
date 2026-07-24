@@ -73,6 +73,11 @@ type runningActor struct {
 	// ReadStdout/ReadStderr calls fail and the forwarding goroutines exit (io.EOF).
 	// nil if forwarding was not started (e.g. a best-effort post-restore dial failed).
 	logAgent *kata.AgentClient
+
+	// workloadIDs are the kata overlay-workload container ids (overlayWorkloadID of
+	// each container name) running in the guest. The SIGTERM handler signals and
+	// waits on these to gracefully stop the actor before the VM is torn down.
+	workloadIDs []string
 }
 
 // baseIDFile is a tiny snapshot file (under the checkpoint/restore dir) holding
@@ -111,6 +116,17 @@ const maxActorContainers = 25
 // id (names are unique within an actor) — even for containers named "x" and "x-ovl". A
 // "-ovl" suffix would let "x"'s workload id collide with the "x-ovl" carrier id.
 func overlayWorkloadID(name string) string { return name + "_ovl" }
+
+// overlayWorkloadIDs returns the overlay-workload container ids for the actor's
+// containers, in order. Recorded on runningActor so the SIGTERM handler knows
+// which guest workloads to signal and wait on.
+func overlayWorkloadIDs(ctrs []actorContainer) []string {
+	ids := make([]string, 0, len(ctrs))
+	for _, c := range ctrs {
+		ids = append(ids, overlayWorkloadID(c.name))
+	}
+	return ids
+}
 
 // actorContainer is one of the actor's containers prepared for the shared micro-VM:
 // its name (also the kata containerID + the overlay lower's find-paths subdir), the
@@ -188,6 +204,10 @@ func writeGuestResolvConf(rootfs string) error {
 func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkloadRequest) (resp *ateompb.RunWorkloadResponse, retErr error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
 
 	atespace := req.GetAtespace()
 	name := req.GetActorName()
@@ -357,8 +377,9 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		return nil, fmt.Errorf("while waiting for container readyz: %w", err)
 	}
 
-	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: actorUID, logAgent: ac}
+	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: actorUID, logAgent: ac, workloadIDs: overlayWorkloadIDs(ctrs)}
 	s.running[actorUID] = ra
+
 
 	// Forward each container's stdout/stderr into the pod logs. The overlay workload's
 	// container/exec id is <name>_ovl (see startOverlayContainer), so key the streams by

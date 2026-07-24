@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
@@ -45,6 +46,10 @@ import (
 func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (*ateompb.CheckpointWorkloadResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
 
 	atespace := req.GetAtespace()
 	name := req.GetActorName()
@@ -167,6 +172,81 @@ func listFiles(dir string) ([]string, error) {
 		}
 	}
 	return files, nil
+}
+
+// gracefulShutdown propagates SIGTERM into every running actor's guest, waits for
+// the workloads to exit, then tears each VM down, so the caller can exit cleanly.
+// Following the design's race-condition handling, it takes the lock only to flip
+// the draining flag and snapshot the running actors, then releases it before any
+// blocking signaling/waiting so it never holds the lock for the whole grace period.
+func (s *AteomService) gracefulShutdown(ctx context.Context) {
+	s.lock.Lock()
+	s.shuttingDown = true
+	type actorEntry struct {
+		id string
+		ra *runningActor
+	}
+	actors := make([]actorEntry, 0, len(s.running))
+	for id, ra := range s.running {
+		actors = append(actors, actorEntry{id: id, ra: ra})
+	}
+	s.lock.Unlock()
+
+	if len(actors) == 0 {
+		slog.InfoContext(ctx, "No active actor sessions at shutdown; exiting cleanly")
+		return
+	}
+
+	for _, e := range actors {
+		s.gracefullyStopActor(ctx, e.id, e.ra)
+	}
+	slog.InfoContext(ctx, "All actor sessions stopped; shutting down cleanly")
+}
+
+// gracefullyStopActor signals the actor's guest workloads with SIGTERM, waits for
+// them to exit, then tears the VM down. The wait blocks until the workloads exit
+// or the kubelet SIGKILLs ateom at grace-period expiry, whichever comes first.
+func (s *AteomService) gracefullyStopActor(ctx context.Context, id string, ra *runningActor) {
+	if ra == nil {
+		return
+	}
+
+	// Obtain a kata-agent client to signal the guest: reuse the log-forwarding
+	// connection if it's open, else dial a fresh one (best-effort). A dial we open
+	// here is closed here; ra.logAgent is left for teardownActor to close.
+	agent := ra.logAgent
+	var dialed *kata.AgentClient
+	if agent == nil {
+		if a, err := dialAgentRetry(ctx, kata.VsockSocketPath(id), 15*time.Second); err != nil {
+			slog.WarnContext(ctx, "Could not dial kata-agent for graceful stop; tearing VM down", slog.String("id", id), slog.Any("err", err))
+		} else {
+			agent, dialed = a, a
+		}
+	}
+
+	if agent != nil {
+		// Propagate SIGTERM to each workload so the actor can save state & close
+		// connections. ExecId == ContainerId targets the workload's init process.
+		for _, wid := range ra.workloadIDs {
+			if err := agent.SignalProcess(ctx, wid, wid, uint32(syscall.SIGTERM)); err != nil {
+				slog.WarnContext(ctx, "Failed to propagate SIGTERM to guest workload", slog.String("id", id), slog.String("workload", wid), slog.Any("err", err))
+			}
+		}
+		// Wait for each workload to exit (mimics waitpid) before tearing the VM down.
+		for _, wid := range ra.workloadIDs {
+			if _, err := agent.WaitProcess(ctx, wid, wid); err != nil {
+				slog.WarnContext(ctx, "Failed while waiting for guest workload to exit", slog.String("id", id), slog.String("workload", wid), slog.Any("err", err))
+			}
+		}
+		if dialed != nil {
+			_ = dialed.Close()
+		}
+	}
+
+	// Stop the guest VM (CH REST shutdown) and reap the ateom-owned processes and
+	// per-sandbox host state. teardownActor also closes ra.logAgent.
+	client := ch.NewClient(ra.apiSocket)
+	s.teardownActor(ctx, id, ra, client)
 }
 
 // teardownActor stops the ateom-owned CH VMM for an actor. Best-effort: the

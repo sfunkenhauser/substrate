@@ -54,6 +54,10 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
+
 	atespace := req.GetAtespace()
 	name := req.GetActorName()
 	actorUID := req.GetActorUid()
@@ -186,7 +190,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		return nil, fmt.Errorf("while waiting for container readyz: %w", err)
 	}
 
-	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir}
+	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir, workloadIDs: overlayWorkloadIDs(ctrs)}
 
 	// Re-attach stdout/stderr forwarding for each container: the restored guest's
 	// containers + kata-agent are alive, so a fresh dial over this actor's vsock

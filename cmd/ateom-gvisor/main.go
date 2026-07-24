@@ -23,9 +23,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/internal/actorlog"
@@ -48,7 +50,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -147,12 +151,36 @@ func do(ctx context.Context) error {
 	ateompb.RegisterAteomServer(svr, ateomService)
 	reflection.Register(svr)
 
+	// Trap SIGTERM (sent by the kubelet at the start of the pod's termination
+	// grace period) and propagate it into the sandbox so the actor can save its
+	// state and exit cleanly before the grace period expires. We deliberately do
+	// not call svr.GracefulStop(): the server stays up so it can reject any new
+	// workload RPCs with codes.Unavailable while draining (see rejectIfDraining).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.InfoContext(ctx, "Received signal; beginning graceful shutdown", slog.String("signal", sig.String()))
+		// Use a fresh context: the do() context is torn down on return, but the
+		// shutdown must outlive it until the sandbox has stopped.
+		ateomService.gracefulShutdown(context.Background())
+		os.Exit(0)
+	}()
+
 	if err := svr.Serve(lis); err != nil {
 		slog.ErrorContext(ctx, "Failed to serve", slog.Any("err", err))
 		os.Exit(1)
 	}
 
 	return nil
+}
+
+// gvisorSession captures the in-memory metadata for the actor currently running
+// in the sandbox, so the SIGTERM handler knows which containers to signal and
+// wait on during graceful shutdown. The worker runs one actor at a time.
+type gvisorSession struct {
+	rcmd       *runsc
+	containers []string
 }
 
 // AteomService is a service for shepherding single microvm.
@@ -162,6 +190,14 @@ type AteomService struct {
 	// Let's go ahead and assume that Ateom RPCs that are running `runsc`
 	// subcommands are probably not safe to call concurrently.
 	lock sync.Mutex
+
+	// shuttingDown is set once SIGTERM has been received. While true, new
+	// workload RPCs are rejected with codes.Unavailable. Guarded by lock.
+	shuttingDown bool
+
+	// activeSession tracks the currently running actor (nil when idle). Set by
+	// RunWorkload/RestoreWorkload, cleared by CheckpointWorkload. Guarded by lock.
+	activeSession *gvisorSession
 
 	interiorNetNS netns.NsHandle
 	actorLogger   *actorlog.ActorLogger
@@ -178,10 +214,67 @@ func NewService(interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger)
 	return svc
 }
 
+// rejectIfDraining returns a codes.Unavailable error if ateom has begun graceful
+// shutdown, so the control plane reschedules the actor onto a live worker. Must
+// be called with s.lock held.
+func (s *AteomService) rejectIfDraining() error {
+	if s.shuttingDown {
+		return status.Error(codes.Unavailable, "worker draining: not accepting new workloads")
+	}
+	return nil
+}
+
+// gracefulShutdown propagates SIGTERM into the sandbox and waits for the actor's
+// containers to exit, then returns so the caller can exit cleanly. Following the
+// design's race-condition handling, it acquires the lock only to flip the
+// draining flag and snapshot the active session, then releases it before doing
+// any blocking signaling/waiting so it never holds the lock for the whole grace
+// period.
+func (s *AteomService) gracefulShutdown(ctx context.Context) {
+	s.lock.Lock()
+	s.shuttingDown = true
+	session := s.activeSession
+	s.lock.Unlock()
+
+	if session == nil {
+		slog.InfoContext(ctx, "No active actor session at shutdown; exiting cleanly")
+		return
+	}
+
+	// Propagate SIGTERM to each application container so the actor can save its
+	// state and close connections. If the actor installed no SIGTERM handler it
+	// terminates immediately, which cmdWait observes as a clean stop.
+	for _, name := range session.containers {
+		if err := session.rcmd.cmdKill(ctx, name, "SIGTERM"); err != nil {
+			slog.WarnContext(ctx, "Failed to propagate SIGTERM to container", slog.String("container", name), slog.Any("err", err))
+		}
+	}
+	// Block until every application container has exited (or the kubelet SIGKILLs
+	// us at grace-period expiry, whichever comes first).
+	for _, name := range session.containers {
+		if err := session.rcmd.cmdWait(ctx, name); err != nil {
+			slog.WarnContext(ctx, "Failed while waiting for container to exit", slog.String("container", name), slog.Any("err", err))
+		}
+	}
+	slog.InfoContext(ctx, "All application containers stopped; shutting down cleanly")
+}
+
+// containerNames extracts the container names from a workload spec.
+func containerNames(containers []*ateompb.Container) []string {
+	names := make([]string, 0, len(containers))
+	for _, c := range containers {
+		names = append(names, c.GetName())
+	}
+	return names
+}
+
 func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkloadRequest) (resp *ateompb.RunWorkloadResponse, retErr error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
 	s.actorLogger.EmitLifecycleLog("Actor starting", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
 	// Contract with atelet:
@@ -253,6 +346,9 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 
 	s.actorLogger.EmitLifecycleLog("Actor started", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
+	// Record the active session so the SIGTERM handler knows what to signal.
+	s.activeSession = &gvisorSession{rcmd: rcmd, containers: containerNames(req.GetSpec().GetContainers())}
+
 	return &ateompb.RunWorkloadResponse{}, nil
 }
 
@@ -261,6 +357,9 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	defer s.lock.Unlock()
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointing", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
 
 	// Contract with atelet:
 	//
@@ -332,6 +431,9 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	// The actor has been checkpointed and torn down; there is no longer an
+	// active session for the SIGTERM handler to signal.
+	s.activeSession = nil
 
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
@@ -384,6 +486,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	defer s.lock.Unlock()
 
 	s.actorLogger.EmitLifecycleLog("Actor restoring", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	if err := s.rejectIfDraining(); err != nil {
+		return nil, err
+	}
 
 	// Contract with atelet:
 	//
@@ -477,6 +582,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor restored", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	// Record the active session so the SIGTERM handler knows what to signal.
+	s.activeSession = &gvisorSession{rcmd: rcmd, containers: containerNames(req.GetSpec().GetContainers())}
 
 	return &ateompb.RestoreWorkloadResponse{}, nil
 }
